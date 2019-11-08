@@ -5,10 +5,9 @@
 from __future__ import unicode_literals
 import frappe
 import os
-import json
 from frappe import _
 from frappe.model.document import Document
-from ftplib import FTP, FTP_TLS, error_perm
+import ftp, json
 from frappe.utils.backups import new_backup
 from frappe.utils.background_jobs import enqueue
 from six.moves.urllib.parse import urlparse, parse_qs
@@ -18,7 +17,6 @@ from frappe.utils import (cint, split_emails,
 	get_files_path, get_backups_path, get_url, encode)
 from six import text_type
 from ftplib import FTP, FTP_TLS
-from dateutil import parser
 
 ignore_list = [".DS_Store"]
 
@@ -94,23 +92,17 @@ def send_email(success, service_name, error_status=None):
 	recipients = split_emails(frappe.db.get_value("FTP Backup Settings", None, "send_notifications_to"))
 	frappe.sendmail(recipients=recipients, subject=subject, message=message)
 
-def combine_path(root_dir, dst_dir):
-	return '/'.join([] + root_dir.lstrip('/').split('/') + dst_dir.strip('/').split('/'))
-
 def backup_to_ftp(upload_db_backup=True):
 	if not frappe.db:
 		frappe.connect()
 
 	# upload database
-	ftp_settings, use_tls, root_directory, file_backup, limit_no_of_backups, no_of_backups  = get_ftp_settings()
+	ftp_settings, use_tls = get_ftp_settings()
 
 	if not ftp_settings['host']:
 		return 'Failed backup upload', 'No FTP host! Please enter valid host for FTP.'
 
-	if not ftp_settings['user']:
-		return 'Failed backup upload', 'No FTP username! Please enter valid username for FTP.'
-
-	if not root_directory:
+	if not ftp_settings['username']:
 		return 'Failed backup upload', 'No FTP username! Please enter valid username for FTP.'
 
 	ftp_client = FTP_TLS(**ftp_settings) if use_tls else FTP(**ftp_settings)
@@ -119,19 +111,19 @@ def backup_to_ftp(upload_db_backup=True):
 		if upload_db_backup:
 			backup = new_backup(ignore_files=True)
 			filename = os.path.join(get_backups_path(), os.path.basename(backup.backup_path_db))
-			upload_file_to_ftp(filename, combine_path(root_directory, "/database"), ftp_client)
+			upload_file_to_ftp(filename, "/database", ftp_client)
 
 			# delete older databases
-			if limit_no_of_backups:
-				delete_older_backups(ftp_client, combine_path(root_directory, "/database"), no_of_backups)
+			if ftp_settings['no_of_backups']:
+				delete_older_backups(ftp_client, "/database", ftp_settings['no_of_backups'])
 
 		# upload files to files folder
 		did_not_upload = []
 		error_log = []
 
-		if file_backup:
-			upload_from_folder(get_files_path(), 0, combine_path(root_directory, "/files"), ftp_client, did_not_upload, error_log)
-			upload_from_folder(get_files_path(is_private=1), 1, combine_path(root_directory, "/private/files"), ftp_client, did_not_upload, error_log)
+		if ftp_settings['file_backup']:
+			upload_from_folder(get_files_path(), 0, "/files", ftp_client, did_not_upload, error_log)
+			upload_from_folder(get_files_path(is_private=1), 1, "/private/files", ftp_client, did_not_upload, error_log)
 
 		return did_not_upload, list(set(error_log))
 
@@ -150,7 +142,7 @@ def upload_from_folder(path, is_private, ftp_folder, ftp_client, did_not_upload,
 	path = text_type(path)
 
 	for f in frappe.get_all("File", filters={"is_folder": 0, "is_private": is_private,
-		"uploaded_to_dropbox": 0}, fields=['file_url', 'name', 'file_name']):
+		"uploaded_to_ftp": 0}, fields=['file_url', 'name', 'file_name']):
 		if is_private:
 			filename = f.file_url.replace('/private/files/', '')
 		else:
@@ -186,88 +178,139 @@ def upload_file_to_ftp(filename, folder, ftp_client):
 	if not os.path.exists(filename):
 		return
 
-	with open(encode(filename), 'rb') as f:
-		path = "{0}/{1}".format(folder, os.path.basename(filename))
+	create_folder_if_not_exists(folder, ftp_client)
+	chunk_size = 15 * 1024 * 1024
+	file_size = os.path.getsize(encode(filename))
+	mode = (ftp.files.WriteMode.overwrite)
 
-		try:
-			create_folder_if_not_exists(ftp_client, folder)
-			pwd = ftp_client.pwd()
-			ftp_client.cwd(folder)
+	f = open(encode(filename), 'rb')
+	path = "{0}/{1}".format(folder, os.path.basename(filename))
 
-			ftp_client.storbinary('STOR %s' % os.path.basename(filename), f)
-			
-			ftp_client.cwd(pwd)
-		except Exception:
+	try:
+		if file_size <= chunk_size:
+			ftp_client.files_upload(f.read(), path, mode)
+		else:
+			upload_session_start_result = ftp_client.files_upload_session_start(f.read(chunk_size))
+			cursor = ftp.files.UploadSessionCursor(session_id=upload_session_start_result.session_id, offset=f.tell())
+			commit = ftp.files.CommitInfo(path=path, mode=mode)
+
+			while f.tell() < file_size:
+				if ((file_size - f.tell()) <= chunk_size):
+					ftp_client.files_upload_session_finish(f.read(chunk_size), cursor, commit)
+				else:
+					ftp_client.files_upload_session_append(f.read(chunk_size), cursor.session_id,cursor.offset)
+					cursor.offset = f.tell()
+	except ftp.exceptions.ApiError as e:
+		if isinstance(e.error, ftp.files.UploadError):
 			error = "File Path: {path}\n".format(path=path)
 			error += frappe.get_traceback()
 			frappe.log_error(error)
-			print (error)
-		
-def create_folder_if_not_exists(ftp_client, path):
-	def _mkdirs_(currentDir):
-		if currentDir != "":
-			try:
-				ftp_client.cwd(currentDir)
-			except error_perm:
-				_mkdirs_('/'.join(currentDir.split('/')[:-1]))
-				ftp_client.mkd(currentDir)
-				ftp_client.cwd(currentDir)
+		else:
+			raise
 
-	pwd = ftp_client.pwd()
-	path = '/'.join([pwd.rstrip('/'), path.lstrip('/')])
-	_mkdirs_(path)
-	ftp_client.cwd(pwd)
+def create_folder_if_not_exists(folder, ftp_client):
+	try:
+		ftp_client.files_get_metadata(folder)
+	except ftp.exceptions.ApiError as e:
+		# folder not found
+		if isinstance(e.error, ftp.files.GetMetadataError):
+			ftp_client.files_create_folder(folder)
+		else:
+			raise
 
 def update_file_ftp_status(file_name):
-	frappe.db.set_value("File", file_name, 'uploaded_to_dropbox', 1, update_modified=False)
+	frappe.db.set_value("File", file_name, 'uploaded_to_ftp', 1, update_modified=False)
 
 def is_fresh_upload():
-	file_name = frappe.db.get_value("File", {'uploaded_to_dropbox': 1}, 'name')
+	file_name = frappe.db.get_value("File", {'uploaded_to_ftp': 1}, 'name')
 	return not file_name
 
 def get_uploaded_files_meta(ftp_folder, ftp_client):
 	try:
-		return {'entries': ftp_client.nlst(ftp_folder) }
-	except error_perm as e:
-		if str(e) == "550 No files found":
-			return {'entries': [] }
+		return ftp_client.files_list_folder(ftp_folder)
+	except ftp.exceptions.ApiError as e:
+		# folder not found
+		if isinstance(e.error, ftp.files.ListFolderError):
+			return frappe._dict({"entries": []})
 		else:
 			raise
 
-def decorate_files(ftp_client, filenames):
-    latest_time = None
-
-    for name in filenames:
-        time = ftp_client.voidcmd("MDTM " + name)
-        if (latest_time is None) or (time > latest_time):
-            latest_time = time
-        
-        yield name, latest_time
-
 def get_ftp_settings():
-	print ('get_ftp_settings')
 	settings = frappe.get_doc("FTP Backup Settings")
 
 	app_details = {
 		"host": settings.ftp_host,
 		"user": 'anonymous' if settings.ftp_authentication == 'Anonymous' else settings.ftp_username,
-		"passwd": '' if settings.ftp_authentication == 'Anonymous' else settings.get_password(fieldname="ftp_password", raise_exception=False)
+		"password": '' if settings.ftp_authentication == 'Anonymous' else settings.ftp_password,
 	}
 
-	return app_details, settings.ftp_tls, settings.ftp_root_directory, settings.file_backup, settings.limit_no_of_backups, settings.no_of_backups 
+	return app_details, settings.ftp_tls
 
 def delete_older_backups(ftp_client, folder_path, to_keep):
-	print ('delete_older_backups')
-	res = get_uploaded_files_meta(folder_path, ftp_client, )
+	res = ftp_client.files_list_folder(path=folder_path)
 	files = []
-	for ft in decorate_files(ftp_client, res['entries']):
-		files.append(ft)
+	for f in res.entries:
+		if isinstance(f, ftp.files.FileMetadata) and 'sql' in f.name:
+			files.append(f)
 
 	if len(files) <= to_keep:
 		return
 
-	files.sort(key=lambda item:item[1], reverse=True)
-	for f, _ in files[to_keep:]:
-		print ('delete', f)
-		ftp_client.delete(f)
+	files.sort(key=lambda item:item.client_modified, reverse=True)
+	for f in files[to_keep:]:
+		ftp_client.files_delete(os.path.join(folder_path, f.name))
 
+@frappe.whitelist()
+def get_ftp_authorize_url():
+	app_details = get_ftp_settings(redirect_uri=True)
+	ftp_oauth_flow = ftp.FTPOAuth2Flow(
+		app_details["app_key"],
+		app_details["app_secret"],
+		app_details["redirect_uri"],
+		{},
+		"ftp-auth-csrf-token"
+	)
+
+	auth_url = ftp_oauth_flow.start()
+
+	return {
+		"auth_url": auth_url,
+		"args": parse_qs(urlparse(auth_url).query)
+	}
+
+@frappe.whitelist()
+def ftp_auth_finish(return_access_token=False):
+	app_details = get_ftp_settings(redirect_uri=True)
+	callback = frappe.form_dict
+	close = '<p class="text-muted">' + _('Please close this window') + '</p>'
+
+	ftp_oauth_flow = ftp.FTPOAuth2Flow(
+		app_details["app_key"],
+		app_details["app_secret"],
+		app_details["redirect_uri"],
+		{
+			'ftp-auth-csrf-token': callback.state
+		},
+		"ftp-auth-csrf-token"
+	)
+
+	if callback.state or callback.code:
+		token = ftp_oauth_flow.finish({'state': callback.state, 'code': callback.code})
+		if return_access_token and token.access_token:
+			return token.access_token, callback.state
+
+		set_ftp_access_token(token.access_token)
+	else:
+		frappe.respond_as_web_page(_("FTP Setup"),
+			_("Illegal Access Token. Please try again") + close,
+			indicator_color='red',
+			http_status_code=frappe.AuthenticationError.http_status_code)
+
+	frappe.respond_as_web_page(_("FTP Setup"),
+		_("FTP access is approved!") + close,
+		indicator_color='green')
+
+@frappe.whitelist(allow_guest=True)
+def set_ftp_access_token(access_token):
+	frappe.db.set_value("FTP Backup Settings", None, 'ftp_access_token', access_token)
+	frappe.db.commit()
