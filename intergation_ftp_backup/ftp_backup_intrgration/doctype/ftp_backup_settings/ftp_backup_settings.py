@@ -95,7 +95,7 @@ def send_email(success, service_name, error_status=None):
 	frappe.sendmail(recipients=recipients, subject=subject, message=message)
 
 def combine_path(root_dir, dst_dir):
-	return '/'.join([] + root_dir.lstrip('/').split('/') + dst_dir.strip('/').split('/'))
+	return '/'.join([] + root_dir.rstrip('/').split('/') + dst_dir.strip('/').split('/'))
 
 def backup_to_ftp(upload_db_backup=True):
 	if not frappe.db:
