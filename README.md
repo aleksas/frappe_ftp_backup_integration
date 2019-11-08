@@ -6,6 +6,10 @@ Very early production stage. Use at your own risk.
 - Tested  on v11 only.
 
 
+## Hack
+
+- Currently reports file upload as 'uploaded_to_dropbox' which is registered in [HERE](https://github.com/frappe/frappe/blob/version-11/frappe/core/doctype/file/file.json#L701)
+
 #### License
 
 MIT
