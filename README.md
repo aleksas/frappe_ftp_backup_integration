@@ -3,7 +3,7 @@
 Very early production stage. Use at your own risk.
 
 - Add FTP backup functionality
-- Tested  on v11 only.
+- Tested lightly  on v11 only.
 
 
 ## Hack
