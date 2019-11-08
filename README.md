@@ -16,6 +16,7 @@ MIT
 
 ## Frappe Install
 `bench get-app intergation_ftp_backup https://github.com/aleksas/frappe_ftp_backup_integration.git`
+`bench --site site1.local install-app intergation_ftp_backup`
 
 ## Settings 
 
