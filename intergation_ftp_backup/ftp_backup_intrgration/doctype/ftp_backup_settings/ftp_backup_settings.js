@@ -8,7 +8,7 @@ frappe.ui.form.on('FTP Backup Settings', {
 	},
 
 	take_backup: function(frm) {
-		if (frm.doc.enabled && (frm.doc.ftp_username && frm.doc.ftp_password)) {
+		if (frm.doc.enabled && (frm.doc.ftp_authentication=='Anonymous' || (frm.doc.ftp_username && frm.doc.ftp_password))) {
 			frm.add_custom_button(__("Take Backup Now"), function(frm){
 				frappe.call({
 					method: "intergation_ftp_backup.ftp_backup_intrgration.doctype.ftp_backup_settings.ftp_backup_settings.take_backup",
